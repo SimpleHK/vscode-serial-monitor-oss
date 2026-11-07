@@ -127,7 +127,9 @@ interface PortSession {
   logDesired: boolean;
   sessionLogFile?: string;
   /** Set while a live param-edit reconnect is in flight: the idle hop must
-   * not clear the log file, and the connected hop must not re-arm a dialog. */
+   * not clear the log file, and the connected hop must not re-arm a dialog.
+   * Cleared by an arriving disconnect — the stop request cancels the
+   * pending reopen. */
   reconnecting?: boolean;
 }
 
@@ -234,13 +236,23 @@ export class MonitorViewProvider implements vscode.WebviewViewProvider {
           void (async () => {
             const keepFile = s.sessionLogFile;
             s.reconnecting = true;
-            await s.controller.disconnect();
-            if (keepFile) {
-              s.sessionLogFile = keepFile;
-            }
-            await s.controller.connect(reconnectSettings);
-            if (s.controller.state === 'connected') {
-              void this.pushRecentBaud(reconnectSettings.baudRate);
+            try {
+              await s.controller.disconnect();
+              // ■ pressed inside the window (the teardown's idle hop makes a
+              // concurrent disconnect a no-op): the stop outranks the edit —
+              // abandon the reopen instead of bringing the port back up.
+              if (!s.reconnecting) {
+                return;
+              }
+              if (keepFile) {
+                s.sessionLogFile = keepFile;
+              }
+              await s.controller.connect(reconnectSettings);
+              if (s.controller.state === 'connected') {
+                void this.pushRecentBaud(reconnectSettings.baudRate);
+              }
+            } finally {
+              s.reconnecting = false;
             }
           })();
           break;
@@ -248,6 +260,7 @@ export class MonitorViewProvider implements vscode.WebviewViewProvider {
         case 'disconnect': {
           const s = this.sessions.get(msg.sessionId);
           if (s?.kind === 'port') {
+            s.reconnecting = false; // cancels an in-flight param-edit reconnect
             void s.controller.disconnect();
           }
           break;

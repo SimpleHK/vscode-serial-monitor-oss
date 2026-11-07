@@ -45,6 +45,10 @@ const ports: FakePort[] = [];
 /** Set before a connect to make the next port.open fail (set BEFORE firing,
  * because the provider opens the port inside the same tick). */
 let openError: Error | undefined;
+/** When set, port.open()/close() parks until released — a controllable
+ * reconnect window for testing ■ pressed mid-reconnect. */
+let openGate: Promise<void> | undefined;
+let closeGate: Promise<void> | undefined;
 
 class FakeBackend {
   async listPorts() {
@@ -57,8 +61,15 @@ class FakeBackend {
         if (openError) {
           throw openError;
         }
+        if (openGate) {
+          await openGate;
+        }
       }),
-      close: vi.fn(async () => undefined),
+      close: vi.fn(async () => {
+        if (closeGate) {
+          await closeGate;
+        }
+      }),
       write: vi.fn(async () => undefined),
       onData: (cb: (chunk: Uint8Array) => void) => {
         dataCbs.push(cb);
@@ -397,5 +408,47 @@ describe('MonitorViewProvider (host layer, vscode-mocked)', () => {
     expect(getConfigUpdates()).toContainEqual({ key: 'timestamps', value: true });
     fireConfigChange('serialMonitor.timestamps');
     expect(findMsg('timestamps', { enabled: true })).toBeTruthy();
+  });
+});
+
+// -- ■ pressed during a live param-edit reconnect -------------------------------
+// Field report: with two panes open, ■ sometimes does nothing. The webview
+// always posts disconnect (webviewStopButton matrix); the loss was here —
+// the reconnect flow tears the connection down, and a disconnect arriving
+// in that window hit the controller's idle no-op. The flow then reopened
+// the port as if nothing had been asked.
+
+describe('■ pressed during a live param-edit reconnect', () => {
+  it('a disconnect inside the reconnect window is honored — the port stays closed', async () => {
+    fire({ type: 'connect', port: 'COM10', baudRate: 115200, dataBits: 8, stopBits: 1, parity: 'none' });
+    await tick();
+    const id = (findLastMsg('sessionCreated') as { sessionId: number }).sessionId;
+    expect(findLastMsg('state', { state: 'connected' })).toBeTruthy();
+
+    // Start a baud-edit reconnect with the TEARDOWN parked on a gate: the
+    // controller is already in the idle state (setState runs before
+    // port.close()), so a disconnect arriving now hits the idle no-op —
+    // exactly the user's window.
+    let release!: () => void;
+    closeGate = new Promise<void>((r) => {
+      release = r;
+    });
+    fire({ type: 'reconnect', sessionId: id, settings: { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none' } });
+    await tick();
+    posted.length = 0;
+
+    // The user presses ■ inside the window.
+    fire({ type: 'disconnect', sessionId: id });
+    await tick();
+    posted.length = 0;
+
+    // Let the suspended teardown (and the reopen behind it) resume.
+    release();
+    closeGate = undefined;
+    await tick();
+
+    // The stop request is honored: nothing re-connects the port after it.
+    expect(findLastMsg('state', { state: 'connected' })).toBeUndefined();
+    expect(ports.at(-1)?.close).toHaveBeenCalled();
   });
 });
