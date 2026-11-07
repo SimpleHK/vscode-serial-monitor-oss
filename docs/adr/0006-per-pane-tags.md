@@ -20,7 +20,7 @@ device must not collapse its neighbor.
   ⚙ panel, tag-from-selection, highlighting, and find recomputes all read and
   mutate the focused pane's list. Another pane is never touched.
 - **Filter mode is per pane too** — include/exclude over that pane's tags.
-- **Persistence is keyed by port** (`serialMonitor.portTags:
+- **Persistence is keyed by port** (`serialLens.portTags:
   Record<path, Tag[]>`). A port's set survives close/reopen; moving a pane to
   another port starts that port's set. File panes keep session-scoped tags.
 - **The webview owns mutations** through the pure core `shared/tagList.ts`

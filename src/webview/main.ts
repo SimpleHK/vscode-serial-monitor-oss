@@ -3,7 +3,7 @@ declare function acquireVsCodeApi(): { postMessage(msg: unknown): void };
 import { LineDecision, matchLine, isTagPatternValid } from '../shared/tagMatching';
 import { FilterMode, Tag } from '../shared/tag';
 import { makeTag, patchedTag, sanitizeTags, withoutTag } from '../shared/tagList';
-import { icon } from './icons';
+import { icon, IconName } from './icons';
 import { scrollReducer, ScrollState } from '../shared/scrollState';
 import { BAUD_RATE_PRESETS, DEFAULT_BAUD_RATE } from '../shared/baudPresets';
 import { formatLineText } from '../shared/lineText';
@@ -523,11 +523,21 @@ function colorBar(colors: string[]): string {
 
 /** Overview strip beside a pane's scrollbar: one block per tag-highlighted
  * line, squashed to the viewport like the editor's overview ruler. */
-function renderMarksFor(s: PaneSession): void {
+/** The overview strip repaints at most at this rate while a stream floods
+ * in — its pass is O(all visible rows), and a ruler 200 ms stale is
+ * invisible. User actions (tag/filter edits) repaint immediately. */
+const MARKS_MIN_INTERVAL = 200;
+
+function renderMarksFor(s: PaneSession, force = false): void {
   if (!s.marksDirty) {
     return;
   }
+  const now = performance.now();
+  if (!force && s.marksPaintedAt !== undefined && now - s.marksPaintedAt < MARKS_MIN_INTERVAL) {
+    return; // keep the dirty flag: the next interval window repaints
+  }
   s.marksDirty = false;
+  s.marksPaintedAt = now;
   const total = s.visibleIndexes.length;
   const height = Math.max(1, s.dom.log.clientHeight - 8);
   const buckets = new Map<number, string>();
@@ -803,6 +813,21 @@ function dropOldest(s: PaneSession, count: number): void {
   s.marksDirty = true;
 }
 
+/** Buffer-size-dependent button states ONLY — the per-append refresh. The
+ * full refreshPaneControls rewrites ~20 DOM properties and rebuilds three
+ * SVG glyphs; a flood of appends must not pay that every frame. */
+function refreshBufferButtons(s: PaneSession): void {
+  const d = s.dom;
+  const isPort = s.kind === 'port';
+  d.clearBtn.disabled = s.isEmpty === true || (s.lineStore.length === 0 && !isPort);
+  d.exportBtn.disabled = s.lineStore.length === 0 || s.isEmpty === true;
+  // First data retires the "Waiting for data…" hint (all other hint states
+  // belong to the full refresh, which runs on state changes — not appends).
+  if (isPort && s.lineStore.length > 0 && !s.transientMessage) {
+    d.hint.style.display = 'none';
+  }
+}
+
 function appendToSession(s: PaneSession, entries: { text: string; ts?: number }[], dropCount: number): void {
   dropOldest(s, dropCount);
   for (const entry of entries) {
@@ -814,15 +839,49 @@ function appendToSession(s: PaneSession, entries: { text: string; ts?: number }[
   }
   s.marksDirty = true;
   scheduleRender(s);
+  refreshBufferButtons(s);
   if (s.find.open) {
     scheduleFindRecompute(s);
   }
   if (s.scroll === 'follow') {
-    requestAnimationFrame(() => {
-      s.dom.log.scrollTop = s.dom.log.scrollHeight;
-    });
+    followTo(s);
   }
-  refreshPaneControls(s);
+}
+
+// --- Smooth follow ------------------------------------------------------------
+// In follow mode the viewport EASES toward the bottom with a per-frame
+// exponential catch-up instead of teleporting on every append: a flood reads
+// as continuous motion, and the catch-up converges the instant the stream
+// pauses. The animation's own writes are marked programmatic so they never
+// trip the Follow→locked reducer; a USER scroll interrupts instantly through
+// that same reducer (locked → the loop quits on its next frame).
+
+const FOLLOW_CATCHUP = 0.3; // fraction of the remaining distance per frame
+
+function followTo(s: PaneSession): void {
+  if (s.scroll !== 'follow' || s.followAnim !== undefined) {
+    return; // locked, or a catch-up is already running (it re-reads the new target every frame)
+  }
+  const step = () => {
+    s.followAnim = undefined;
+    if (s.scroll !== 'follow') {
+      return; // the user locked while we were in flight — the interrupt stands
+    }
+    const log = s.dom.log;
+    const target = log.scrollHeight - log.clientHeight;
+    const delta = target - log.scrollTop;
+    if (delta <= 0) {
+      if (delta < 0) {
+        log.scrollTop = target; // above bottom (resize/trim): snap back
+      }
+      return; // converged
+    }
+    s.programmatic = true;
+    log.scrollTop += Math.max(1, Math.ceil(delta * FOLLOW_CATCHUP));
+    s.programmatic = false;
+    s.followAnim = requestAnimationFrame(step);
+  };
+  s.followAnim = requestAnimationFrame(step);
 }
 
 function restylePane(s: PaneSession): void {
@@ -832,6 +891,7 @@ function restylePane(s: PaneSession): void {
   rebuildVisibleIndexes(s);
   s.marksDirty = true;
   scheduleRender(s);
+  renderMarksFor(s, true); // user action: the ruler updates NOW, not on the next throttle window
   if (s.find.open) {
     scheduleFindRecompute(s);
   }
@@ -950,6 +1010,16 @@ function ensureEmptySurface(): void {
   });
 }
 
+/** Rewrites a glyph button's innerHTML only when its icon actually changes —
+ * innerHTML assignment parses markup, and refreshPaneControls runs on every
+ * state tick of a streaming pane. */
+function setGlyph(btn: HTMLElement, glyph: IconName): void {
+  if (btn.dataset.glyph !== glyph) {
+    btn.dataset.glyph = glyph;
+    btn.innerHTML = icon(glyph);
+  }
+}
+
 /** Refreshes one pane's self-contained controls from its session state. */
 function refreshPaneControls(s: PaneSession): void {
   const d = s.dom;
@@ -964,7 +1034,7 @@ function refreshPaneControls(s: PaneSession): void {
   if (d.play) {
     d.play.style.display = isPort ? '' : 'none';
     d.play.className = 'start-stop';
-    d.play.innerHTML = isConnected ? icon('stop') : icon('play');
+    setGlyph(d.play, isConnected ? 'stop' : 'play');
     setTip(d.play, isConnected ? `Stop monitoring ${s.title}` : `Start monitoring ${s.title}`);
     d.play.disabled = s.state === 'connecting' || (s.isEmpty === true && !lastPorts.length);
   }
@@ -981,7 +1051,7 @@ function refreshPaneControls(s: PaneSession): void {
     const logOn = isPort && s.logDesired;
     d.logBtn.classList.toggle('on', logOn);
     d.logBtn.classList.toggle('rec', logOn);
-    d.logBtn.innerHTML = logOn ? icon('circle-record') : icon('circle');
+    setGlyph(d.logBtn, logOn ? 'circle-record' : 'circle');
     if (logOn) {
       const where = s.logFile ? ` (now: ${s.logFile})` : s.logDirectory ? ` into ${s.logDirectory}` : '';
       setTip(d.logBtn, `Log to file: on${where} — click to stop`);
@@ -990,7 +1060,7 @@ function refreshPaneControls(s: PaneSession): void {
     }
   }
 
-  d.scrollBtn.innerHTML = s.scroll === 'follow' ? icon('arrow-down') : icon('lock');
+  setGlyph(d.scrollBtn, s.scroll === 'follow' ? 'arrow-down' : 'lock');
   d.scrollBtn.classList.toggle('locked', s.scroll === 'locked');
   setTip(
     d.scrollBtn,
@@ -1335,7 +1405,7 @@ function buildPane(s: PaneSession): PaneDom {
     e.stopPropagation();
     s.scroll = scrollReducer(s.scroll, { type: 'toggle' });
     if (s.scroll === 'follow') {
-      logEl.scrollTop = logEl.scrollHeight;
+      followTo(s);
     }
     refreshPaneControls(s);
   });
@@ -1381,6 +1451,10 @@ function buildPane(s: PaneSession): PaneDom {
   });
 
   logEl.addEventListener('scroll', () => {
+    if (s.programmatic) {
+      s.programmatic = false; // the catch-up's own write — never trips the lock
+      return;
+    }
     const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
     const next = scrollReducer(s.scroll, { type: 'scrolled', atBottom });
     if (next !== s.scroll) {
@@ -1563,6 +1637,48 @@ function createSession(m: {
   if (pendingReplaceNewId === m.sessionId && pendingReplaceOldId !== undefined) {
     const oldPane = sessions.find((x) => x.id === pendingReplaceOldId);
     if (oldPane) {
+      // The log belongs to the PANE, not the connection (GLOSSARY): a
+      // restart — ■/▶, a port move, a parameter change — carries the
+      // buffered lines across the session swap. The arrays move by
+      // reference: the old host session is still live until the connect
+      // completes, so lines it delivers in that window land in the same
+      // store the replacement now shares. Find settings survive too; their
+      // per-line state is recomputed against the fresh DOM.
+      s.lineStore = oldPane.lineStore;
+      s.decisions = oldPane.decisions;
+      s.visibleIndexes = oldPane.visibleIndexes;
+      s.scroll = 'follow'; // ▶ means "rejoin the live tail" — a scroll lock
+      // acquired while browsing the stopped buffer does not survive a start.
+      s.sendHistory = oldPane.sendHistory;
+      s.sendIndex = oldPane.sendIndex;
+      s.sendDraft = oldPane.sendDraft;
+      s.lineEnding = oldPane.lineEnding;
+      s.tags = oldPane.tags;
+      s.filterMode = oldPane.filterMode;
+      s.find = { ...oldPane.find, occurrences: [], byLine: new Map(), debounce: undefined };
+      if (s.find.open) {
+        scheduleFindRecompute(s);
+      }
+      renderChipsInto(s); // the fresh DOM has an empty chip row — paint the inherited tags now
+      s.marksDirty = true; // fresh DOM: the overview strip repaints in full
+      // Paint the restored log SYNCHRONOUSLY: the reveal below happens in
+      // the same synchronous pass as this creation, so a deferred rAF render
+      // would show one blank frame — the flicker the user reported. The
+      // pane is hidden here (clientHeight 0), so this window is just the
+      // overscan rows with correct spacers; the next rAF refines the window
+      // for the now-visible pane.
+      renderWindowFor(s);
+      // Refine the window once the pane is visible (clientHeight > 0).
+      scheduleRender(s);
+      // Viewport handoff: a restart always lands at the bottom. The snap
+      // runs on the next frame (after the rAF render refines the window for
+      // the visible pane) and is marked programmatic so it cannot trip the
+      // Follow→locked reducer.
+      requestAnimationFrame(() => {
+        s.programmatic = true;
+        s.dom.log.scrollTop = s.dom.log.scrollHeight;
+        s.programmatic = false;
+      });
       panesArea.insertBefore(s.dom.root, oldPane.dom.root);
       if (s.dividerLeft) {
         panesArea.insertBefore(s.dividerLeft, s.dom.root);
@@ -1614,6 +1730,9 @@ function removeSession(id: number): void {
   const [gone] = sessions.splice(idx, 1);
   if (gone.find.debounce !== undefined) {
     clearTimeout(gone.find.debounce);
+  }
+  if (gone.followAnim !== undefined) {
+    cancelAnimationFrame(gone.followAnim); // the catch-up dies with its pane
   }
   unregisterControls(gone.dom.ctlRefs);
   gone.dom.root.remove();

@@ -4,7 +4,7 @@ import { Tag } from '../shared/tag';
 /**
  * Persistence boundary so the store stays vscode-free and testable. The
  * production adapter maps this onto workspace settings
- * (`serialMonitor.portTags` — a per-port map, ADR-0006).
+ * (`serialLens.portTags` — a per-port map, ADR-0006; falls back to the pre-rename `serialMonitor.portTags` for existing users).
  */
 export interface PortTagStorage {
   get(): Record<string, Tag[]> | undefined;

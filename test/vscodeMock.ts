@@ -9,10 +9,10 @@ import { vi } from 'vitest';
 export type ConfigListener = (event: { affectsConfiguration: (key: string) => boolean }) => void;
 
 const configValues: Record<string, unknown> = {
-  'serialMonitor.maxBufferLines': 10000,
-  'serialMonitor.timestamps': false,
-  'serialMonitor.logDirectory': '',
-  'serialMonitor.recentBaudRates': [],
+  'serialLens.maxBufferLines': 10000,
+  'serialLens.timestamps': true,
+  'serialLens.logDirectory': '',
+  'serialLens.recentBaudRates': [],
   'serialMonitor.tags': undefined,
 };
 const configUpdates: { key: string; value: unknown }[] = [];
@@ -61,14 +61,14 @@ export const vscode = {
     dispose = () => undefined;
   },
   workspace: {
-    getConfiguration: () => ({
+    getConfiguration: (section: string) => ({
       get: (key: string, fallback?: unknown) => {
-        const v = configValues[`serialMonitor.${key}`];
+        const v = configValues[`${section}.${key}`];
         return v === undefined ? fallback : v;
       },
       update: async (key: string, value: unknown) => {
-        configValues[`serialMonitor.${key}`] = value;
-        configUpdates.push({ key, value });
+        configValues[`${section}.${key}`] = value;
+        configUpdates.push({ key: `${section}.${key}`, value });
       },
     }),
     onDidChangeConfiguration: (cb: ConfigListener) => {
@@ -104,10 +104,10 @@ export function resetVscodeMock(): void {
   for (const key of Object.keys(configValues)) {
     delete configValues[key];
   }
-  configValues['serialMonitor.maxBufferLines'] = 10000;
-  configValues['serialMonitor.timestamps'] = false;
-  configValues['serialMonitor.logDirectory'] = '';
-  configValues['serialMonitor.recentBaudRates'] = [];
+  configValues['serialLens.maxBufferLines'] = 10000;
+  configValues['serialLens.timestamps'] = true;
+  configValues['serialLens.logDirectory'] = '';
+  configValues['serialLens.recentBaudRates'] = [];
   configValues['serialMonitor.tags'] = undefined;
   dialogs.save.mockReset();
   dialogs.open.mockReset();

@@ -78,8 +78,8 @@ Open the monitor: bottom panel → SERIAL MONITOR tab (or `Serial Monitor: Open 
 ## Buffer & performance
 
 - [ ] `burst --seconds 10` (~2000 lines/s): both panes stay smooth (virtualized rendering)
-- [ ] After a long burst, memory stays bounded and the oldest lines are gone (buffer capped at `serialMonitor.maxBufferLines`, default 10,000)
-- [ ] Lower `serialMonitor.maxBufferLines` to e.g. 500 mid-session → buffer trims immediately
+- [ ] After a long burst, memory stays bounded and the oldest lines are gone (buffer capped at `serialLens.maxBufferLines`, default 10,000)
+- [ ] Lower `serialLens.maxBufferLines` to e.g. 500 mid-session → buffer trims immediately
 
 ## Public API (consumer view)
 

@@ -66,25 +66,76 @@ function toLineEnding(value: string): LineEnding {
   return (hit as LineEnding | undefined) ?? 'LF';
 }
 
+/**
+ * Reads a `serialLens.*` setting, falling back to its pre-rename
+ * `serialMonitor.*` value: the extension was renamed (0.6.0) while sharing
+ * that property namespace with the upstream extension id family, which made
+ * VS Code's configuration registry reject one of the two declarations. New
+ * settings live under `serialLens.*`; existing user settings migrate by
+ * fallback until they are rewritten.
+ */
+function readLensSetting<T>(key: string, fallback: T): T {
+  const lens = vscode.workspace.getConfiguration('serialLens').get<T>(key);
+  if (lens !== undefined) {
+    return lens;
+  }
+  return vscode.workspace.getConfiguration('serialMonitor').get<T>(key, fallback) ?? fallback;
+}
+
 function readCap(): number {
-  return vscode.workspace.getConfiguration('serialMonitor').get<number>('maxBufferLines', 10000) ?? 10000;
+  return readLensSetting('maxBufferLines', 10000);
 }
 
 function readTimestamps(): boolean {
-  return vscode.workspace.getConfiguration('serialMonitor').get<boolean>('timestamps', true) ?? true;
+  return readLensSetting('timestamps', true);
 }
 
 function readLogDirectory(): string {
-  return vscode.workspace.getConfiguration('serialMonitor').get<string>('logDirectory', '') ?? '';
+  return readLensSetting('logDirectory', '');
 }
 
 function readRecentBauds(): number[] {
-  return vscode.workspace.getConfiguration('serialMonitor').get<number[]>('recentBaudRates', []) ?? [];
+  return readLensSetting('recentBaudRates', []);
+}
+
+/** One-time migration: the extension was renamed (0.6.0) while sharing the
+ * `serialMonitor.*` property namespace, and the registry rejects a second
+ * declaration of a live property — settings moved to `serialLens.*`. Legacy
+ * values that differ from what the new key already holds are carried over
+ * and the legacy twin is cleared, so both namespaces can never drift. */
+const LEGACY_SETTING_KEYS = [
+  'maxBufferLines',
+  'recentBaudRates',
+  'logDirectory',
+  'timestamps',
+  'portTags',
+] as const;
+
+function sameSetting(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+export function migrateLegacySettings(): void {
+  const legacy = vscode.workspace.getConfiguration('serialMonitor');
+  const lens = vscode.workspace.getConfiguration('serialLens');
+  for (const key of LEGACY_SETTING_KEYS) {
+    const old = legacy.get<unknown>(key);
+    if (old === undefined) {
+      continue; // nothing under the legacy key
+    }
+    const current = lens.get<unknown>(key);
+    if (sameSetting(old, current)) {
+      continue; // already carried over (or both at their default)
+    }
+    void lens.update(key, old, vscode.ConfigurationTarget.Global);
+    void legacy.update(key, undefined, vscode.ConfigurationTarget.Global);
+  }
 }
 
 export function activate(
   context: vscode.ExtensionContext,
 ): { getApi(version: Version, extensionContext: vscode.ExtensionContext): Promise<SerialMonitorApi | undefined> } {
+  migrateLegacySettings();
   const provider = new MonitorViewProvider(context.extensionUri);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(MonitorViewProvider.viewId, provider, {
@@ -127,7 +178,9 @@ interface PortSession {
   logDesired: boolean;
   sessionLogFile?: string;
   /** Set while a live param-edit reconnect is in flight: the idle hop must
-   * not clear the log file, and the connected hop must not re-arm a dialog. */
+   * not clear the log file, and the connected hop must not re-arm a dialog.
+   * Cleared by an arriving disconnect — the stop request cancels the
+   * pending reopen. */
   reconnecting?: boolean;
 }
 
@@ -190,18 +243,18 @@ export class MonitorViewProvider implements vscode.WebviewViewProvider {
       post({ type: 'timestamps', enabled: readTimestamps() });
     };
     const configWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('serialMonitor.maxBufferLines')) {
+      if (e.affectsConfiguration('serialLens.maxBufferLines') || e.affectsConfiguration('serialMonitor.maxBufferLines')) {
         for (const s of this.portSessions) {
           s.controller.setCap(readCap());
         }
       }
-      if (e.affectsConfiguration('serialMonitor.timestamps')) {
+      if (e.affectsConfiguration('serialLens.timestamps') || e.affectsConfiguration('serialMonitor.timestamps')) {
         for (const s of this.portSessions) {
           s.controller.setTimestamps(readTimestamps());
         }
         sendDisplayState();
       }
-      if (e.affectsConfiguration('serialMonitor.logDirectory')) {
+      if (e.affectsConfiguration('serialLens.logDirectory') || e.affectsConfiguration('serialMonitor.logDirectory')) {
         for (const s of this.portSessions) {
           this.sendLoggingState(s);
         }
@@ -234,13 +287,23 @@ export class MonitorViewProvider implements vscode.WebviewViewProvider {
           void (async () => {
             const keepFile = s.sessionLogFile;
             s.reconnecting = true;
-            await s.controller.disconnect();
-            if (keepFile) {
-              s.sessionLogFile = keepFile;
-            }
-            await s.controller.connect(reconnectSettings);
-            if (s.controller.state === 'connected') {
-              void this.pushRecentBaud(reconnectSettings.baudRate);
+            try {
+              await s.controller.disconnect();
+              // ■ pressed inside the window (the teardown's idle hop makes a
+              // concurrent disconnect a no-op): the stop outranks the edit —
+              // abandon the reopen instead of bringing the port back up.
+              if (!s.reconnecting) {
+                return;
+              }
+              if (keepFile) {
+                s.sessionLogFile = keepFile;
+              }
+              await s.controller.connect(reconnectSettings);
+              if (s.controller.state === 'connected') {
+                void this.pushRecentBaud(reconnectSettings.baudRate);
+              }
+            } finally {
+              s.reconnecting = false;
             }
           })();
           break;
@@ -248,6 +311,7 @@ export class MonitorViewProvider implements vscode.WebviewViewProvider {
         case 'disconnect': {
           const s = this.sessions.get(msg.sessionId);
           if (s?.kind === 'port') {
+            s.reconnecting = false; // cancels an in-flight param-edit reconnect
             void s.controller.disconnect();
           }
           break;
@@ -298,14 +362,14 @@ export class MonitorViewProvider implements vscode.WebviewViewProvider {
           }
           // Persist through the setting so the config watcher syncs the
           // webview's display flag and the choice survives reloads.
-          void updateSerialMonitorSetting('timestamps', enabled);
+          void updateLensSetting('timestamps', enabled);
           break;
         }
         case 'chooseLogDirectory':
           void this.chooseLogDirectory();
           break;
         case 'clearLogDirectory':
-          void updateSerialMonitorSetting('logDirectory', '');
+          void updateLensSetting('logDirectory', '');
           for (const s of this.portSessions) {
             s.sessionLogFile = undefined;
             this.sendLoggingState(s);
@@ -604,7 +668,7 @@ export class MonitorViewProvider implements vscode.WebviewViewProvider {
 
   private async pushRecentBaud(baudRate: number): Promise<void> {
     const next = [baudRate, ...readRecentBauds().filter((b) => b !== baudRate)].slice(0, 5);
-    await updateSerialMonitorSetting('recentBaudRates', next);
+    await updateLensSetting('recentBaudRates', next);
     this.post({ type: 'recentBauds', values: next });
   }
 
@@ -620,7 +684,7 @@ export class MonitorViewProvider implements vscode.WebviewViewProvider {
     if (!picked?.length) {
       return;
     }
-    await updateSerialMonitorSetting('logDirectory', picked[0].fsPath);
+    await updateLensSetting('logDirectory', picked[0].fsPath);
     for (const s of this.portSessions) {
       this.sendLoggingState(s);
     }
@@ -699,22 +763,26 @@ function describe(err: unknown): string {
 
 function workspacePortTagStorage(): PortTagStorage {
   const read = (): Record<string, Tag[]> | undefined =>
+    vscode.workspace.getConfiguration('serialLens').get<Record<string, Tag[]>>('portTags') ??
     vscode.workspace.getConfiguration('serialMonitor').get<Record<string, Tag[]>>('portTags');
   return {
     get: read,
     update: async (map) => {
-      await updateSerialMonitorSetting('portTags', map);
+      await updateLensSetting('portTags', map);
     },
   };
 }
 
-/** Writes a serialMonitor setting, falling back to user scope when no
- * folder is open (workspace-scope updates need a folder). */
-async function updateSerialMonitorSetting(key: string, value: unknown): Promise<void> {
+/** Writes a serialLens setting, falling back to user scope when no folder
+ * is open (workspace-scope updates need a folder). The pre-rename
+ * `serialMonitor.*` twin is cleared at the same target so the legacy key
+ * cannot drift from the migrated one. */
+async function updateLensSetting(key: string, value: unknown): Promise<void> {
   const target = vscode.workspace.workspaceFolders?.length
     ? vscode.ConfigurationTarget.Workspace
     : vscode.ConfigurationTarget.Global;
-  await vscode.workspace.getConfiguration('serialMonitor').update(key, value, target);
+  await vscode.workspace.getConfiguration('serialLens').update(key, value, target);
+  await vscode.workspace.getConfiguration('serialMonitor').update(key, undefined, target);
 }
 
 function toApiSettings(ms: MonitorPortSettings): SerialPortSettings {

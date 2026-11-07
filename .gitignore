@@ -20,3 +20,6 @@ coverage/
 
 # gif frame capture working dir
 .frames/
+
+# perf probe working files
+.frames/.perf-profile/

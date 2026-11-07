@@ -52,28 +52,28 @@
     "configuration": {
       "title": "Serial Monitor",
       "properties": {
-        "serialMonitor.maxBufferLines": {
+        "serialLens.maxBufferLines": {
           "type": "number",
           "default": 10000,
           "minimum": 100,
           "description": "Receive buffer cap in lines; the oldest lines drop out beyond it (applies live)."
         },
-        "serialMonitor.recentBaudRates": {
+        "serialLens.recentBaudRates": {
           "type": "array",
           "default": [],
           "description": "Recently used baud rates, shown first in the quick-pick."
         },
-        "serialMonitor.logDirectory": {
+        "serialLens.logDirectory": {
           "type": "string",
           "default": "",
           "description": "Directory for per-session serial logs: each monitoring session creates a new timestamped .log file there."
         },
-        "serialMonitor.timestamps": {
+        "serialLens.timestamps": {
           "type": "boolean",
           "default": true,
           "description": "Show a receive timestamp at the start of each line (display decoration only; tag matching always uses raw line content)."
         },
-        "serialMonitor.portTags": {
+        "serialLens.portTags": {
           "type": "object",
           "default": {},
           "markdownDescription": "Per-port tag sets (ADR-0006): a map of port path to that port’s tags. Usually managed from the monitor UI.",

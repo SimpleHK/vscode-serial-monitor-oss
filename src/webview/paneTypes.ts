@@ -107,6 +107,17 @@ export interface PaneSession {
   dom: PaneDom;
   lastRender?: { topPx: number; bottomPx: number; rows: RenderedRow[] };
   marksDirty: boolean;
+  /** Last overview-strip paint time: the strip repaints at most every
+   * MARKS_MIN_INTERVAL ms while a stream floods in (its content is O(all
+   * visible rows); a ruler 200 ms stale is invisible, a repaint per append
+   * is not). */
+  marksPaintedAt?: number;
+  /** Smooth-follow catch-up animation (rAF handle), running while the
+   * viewport eases toward the bottom in follow mode. */
+  followAnim?: number;
+  /** True while followTo writes scrollTop — the scroll handler must not
+   * feed the animation's own writes into the Follow→locked reducer. */
+  programmatic?: boolean;
   dividerLeft?: HTMLDivElement;
   sendHistory: string[];
   sendIndex: number;

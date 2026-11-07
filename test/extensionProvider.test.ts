@@ -45,6 +45,10 @@ const ports: FakePort[] = [];
 /** Set before a connect to make the next port.open fail (set BEFORE firing,
  * because the provider opens the port inside the same tick). */
 let openError: Error | undefined;
+/** When set, port.open()/close() parks until released — a controllable
+ * reconnect window for testing ■ pressed mid-reconnect. */
+let openGate: Promise<void> | undefined;
+let closeGate: Promise<void> | undefined;
 
 class FakeBackend {
   async listPorts() {
@@ -57,8 +61,15 @@ class FakeBackend {
         if (openError) {
           throw openError;
         }
+        if (openGate) {
+          await openGate;
+        }
       }),
-      close: vi.fn(async () => undefined),
+      close: vi.fn(async () => {
+        if (closeGate) {
+          await closeGate;
+        }
+      }),
       write: vi.fn(async () => undefined),
       onData: (cb: (chunk: Uint8Array) => void) => {
         dataCbs.push(cb);
@@ -200,7 +211,7 @@ describe('MonitorViewProvider (host layer, vscode-mocked)', () => {
   });
 
   it('appends received lines with timestamps to the right session', async () => {
-    setConfig('serialMonitor.timestamps', true);
+    setConfig('serialLens.timestamps', true);
     fire({ type: 'connect', port: 'COM10', baudRate: 115200, dataBits: 8, stopBits: 1, parity: 'none' });
     await tick();
     posted.length = 0;
@@ -225,7 +236,7 @@ describe('MonitorViewProvider (host layer, vscode-mocked)', () => {
   it('live-reconnects in place and keeps the log file across the idle hop', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'sm-log-'));
     const logPath = path.join(dir, 'session.log');
-    setConfig('serialMonitor.logDirectory', dir);
+    setConfig('serialLens.logDirectory', dir);
     fire({ type: 'connect', port: 'COM10', baudRate: 115200, dataBits: 8, stopBits: 1, parity: 'none' });
     await tick();
     const sid = (findMsg('sessionCreated') as { sessionId: number }).sessionId;
@@ -246,7 +257,7 @@ describe('MonitorViewProvider (host layer, vscode-mocked)', () => {
     ports.at(-1)!.emitData('after reconnect\n');
     const content = await waitForFileContent(path.join(dir, logFileAfter!), 'after reconnect');
     expect(content).toContain('after reconnect');
-    setConfig('serialMonitor.logDirectory', '');
+    setConfig('serialLens.logDirectory', '');
     dialogs.save.mockReset();
   });
 
@@ -352,7 +363,7 @@ describe('MonitorViewProvider (host layer, vscode-mocked)', () => {
     });
     await tick();
     expect(getConfigUpdates()).toContainEqual({
-      key: 'portTags',
+      key: 'serialLens.portTags',
       value: expect.objectContaining({ COM10: expect.arrayContaining([expect.objectContaining({ name: 'ERROR' })]) }),
     });
     // a second port starts with an independent (empty) set
@@ -386,16 +397,78 @@ describe('MonitorViewProvider (host layer, vscode-mocked)', () => {
     await tick();
     // activePath is gone once detached — the pane's own port must key the save
     expect(getConfigUpdates()).toContainEqual({
-      key: 'portTags',
+      key: 'serialLens.portTags',
       value: expect.objectContaining({ COM10: expect.arrayContaining([expect.objectContaining({ name: 'ERROR' })]) }),
     });
   });
 
-  it('persists serialMonitor settings through the config watcher', async () => {
+  it('persists serialLens settings through the config watcher', async () => {
     fire({ type: 'setTimestamps', enabled: true });
     await tick();
-    expect(getConfigUpdates()).toContainEqual({ key: 'timestamps', value: true });
-    fireConfigChange('serialMonitor.timestamps');
+    expect(getConfigUpdates()).toContainEqual({ key: 'serialLens.timestamps', value: true });
+    fireConfigChange('serialLens.timestamps');
     expect(findMsg('timestamps', { enabled: true })).toBeTruthy();
+  });
+
+  it('migrates pre-rename serialMonitor settings into serialLens.*', async () => {
+    // The user's settings all live under the pre-rename namespace (the new
+    // key shipped in 0.6.0 and cannot hold user values yet); the migration
+    // carries every legacy value over and clears the legacy twin.
+    setConfig('serialMonitor.logDirectory', '/legacy-logs');
+    setConfig('serialMonitor.timestamps', false);
+    getConfigUpdates().length = 0;
+
+    const mod = (await import('../src/extension')) as unknown as {
+      migrateLegacySettings(): void;
+    };
+    mod.migrateLegacySettings();
+
+    const updates = getConfigUpdates();
+    expect(updates).toContainEqual({ key: 'serialLens.logDirectory', value: '/legacy-logs' });
+    expect(updates).toContainEqual({ key: 'serialLens.timestamps', value: false });
+    expect(updates).toContainEqual({ key: 'serialMonitor.logDirectory', value: undefined });
+    expect(updates).toContainEqual({ key: 'serialMonitor.timestamps', value: undefined });
+  });
+});
+
+// -- ■ pressed during a live param-edit reconnect -------------------------------
+// Field report: with two panes open, ■ sometimes does nothing. The webview
+// always posts disconnect (webviewStopButton matrix); the loss was here —
+// the reconnect flow tears the connection down, and a disconnect arriving
+// in that window hit the controller's idle no-op. The flow then reopened
+// the port as if nothing had been asked.
+
+describe('■ pressed during a live param-edit reconnect', () => {
+  it('a disconnect inside the reconnect window is honored — the port stays closed', async () => {
+    fire({ type: 'connect', port: 'COM10', baudRate: 115200, dataBits: 8, stopBits: 1, parity: 'none' });
+    await tick();
+    const id = (findLastMsg('sessionCreated') as { sessionId: number }).sessionId;
+    expect(findLastMsg('state', { state: 'connected' })).toBeTruthy();
+
+    // Start a baud-edit reconnect with the TEARDOWN parked on a gate: the
+    // controller is already in the idle state (setState runs before
+    // port.close()), so a disconnect arriving now hits the idle no-op —
+    // exactly the user's window.
+    let release!: () => void;
+    closeGate = new Promise<void>((r) => {
+      release = r;
+    });
+    fire({ type: 'reconnect', sessionId: id, settings: { baudRate: 9600, dataBits: 8, stopBits: 1, parity: 'none' } });
+    await tick();
+    posted.length = 0;
+
+    // The user presses ■ inside the window.
+    fire({ type: 'disconnect', sessionId: id });
+    await tick();
+    posted.length = 0;
+
+    // Let the suspended teardown (and the reopen behind it) resume.
+    release();
+    closeGate = undefined;
+    await tick();
+
+    // The stop request is honored: nothing re-connects the port after it.
+    expect(findLastMsg('state', { state: 'connected' })).toBeUndefined();
+    expect(ports.at(-1)?.close).toHaveBeenCalled();
   });
 });
